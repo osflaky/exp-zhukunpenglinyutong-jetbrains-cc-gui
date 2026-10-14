@@ -1,0 +1,664 @@
+/**
+ * Session-less one-shot text generation via headless CLIs.
+ *
+ * Used by prompt-enhancer and commit-message so Grok / Kimi / OpenCode / PI
+ * can run outside the chat marker protocol (no [MESSAGE_START]/SESSION_ID]/SEND_ERROR]).
+ * Optional progressive tokens go through `onDelta` only — callers emit their own
+ * `[CONTENT_DELTA]` markers for Java process runners.
+ *
+ * SECURITY NOTE: prompts here embed third-party controlled text (git diffs,
+ * pasted content). Grok runs with permissionMode 'deny' (all tool requests
+ * auto-rejected). Kimi / OpenCode / PI expose no headless tool-disable flag;
+ * they rely on each CLI's non-interactive defaults plus a prompt-level
+ * "Do not run tools" instruction. If these CLIs add a read-only/no-tools
+ * flag, wire it here.
+ */
+
+import { homedir } from 'os';
+
+import {
+  resolveGrokCliPath,
+  resolveKimiCliPath,
+  resolveOpenCodeCliPath,
+  resolvePiCliPath,
+  resolveOmpCliPath,
+  resolveMiniMaxCliPath,
+
+  enrichPathWithBinDirs,
+  commonCliBinDirs,
+} from '../utils/cli-path.js';
+import { runCliStreaming } from '../utils/cli-spawn.js';
+import { safePromptArg } from '../utils/marker-protocol.js';
+import { getRealHomeDir } from '../utils/path-utils.js';
+import { runAcpTurn } from './grok/grok-acp-client.js';
+import { buildGrokEnv, resolveEffectiveGrokAuth } from './grok/grok-utils.js';
+
+export const CLI_ASK_PROVIDERS = ['grok', 'kimi', 'opencode', 'pi', 'omp', 'minimax', 'zcode'];
+
+const DEFAULT_MODELS = {
+  grok: 'grok',
+  kimi: 'auto',
+  opencode: 'opencode-default',
+  pi: 'auto',
+  omp: 'auto',
+  minimax: 'auto',
+  zcode: 'auto',
+};
+
+function isDefaultModelToken(model) {
+  if (model == null) return true;
+  const trimmed = String(model).trim();
+  if (!trimmed) return true;
+  const lower = trimmed.toLowerCase();
+  return (
+    lower === '__config_default__'
+    || lower === 'auto'
+    || lower === 'default'
+    || lower === '(default)'
+    || lower === 'config-default'
+    || lower === 'config_default'
+    || lower === 'opencode-default'
+    || lower === 'opencode default'
+    || lower === 'pi-default'
+    || lower === 'pi default'
+    || lower === 'omp-default'
+    || lower === 'omp default'
+  );
+}
+
+function resolveModelFlag(model) {
+  if (isDefaultModelToken(model)) return null;
+  const value = String(model).trim();
+  // A leading dash would be parsed as a new flag instead of the --model value.
+  if (value.startsWith('-')) {
+    console.error(`[CliAsk] dropping suspicious model id: ${value}`);
+    return null;
+  }
+  return value;
+}
+
+function extractAcpText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') return content.text;
+    if (typeof content.content === 'string') return content.content;
+  }
+  return '';
+}
+
+function extractAssistantText(value) {
+  const content = value?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object') {
+          if (typeof part.text === 'string') return part.text;
+          if (typeof part.content === 'string') return part.content;
+        }
+        return '';
+      })
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * Snapshot-style assistant text merge (Kimi often re-emits growing prefixes).
+ */
+export function mergeAssistantTextSnapshot(accumulated, incoming) {
+  if (!incoming) return null;
+  if (!accumulated) return incoming;
+  if (incoming === accumulated) return null;
+  if (incoming.startsWith(accumulated)) return incoming.slice(accumulated.length);
+  if (accumulated.startsWith(incoming)) return null;
+  return `\n${incoming}`;
+}
+
+function firstNonEmptyStr(candidates) {
+  for (const value of candidates) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract a human-readable error from CLI JSON events.
+ * OpenCode 1.x uses nested `{ error: { name, data: { message } } }`.
+ * Exported for unit tests.
+ */
+export function extractCliEventErrorMessage(event) {
+  if (!event || typeof event !== 'object') return null;
+  return firstNonEmptyStr([
+    event?.error?.message,
+    event?.error?.data?.message,
+    typeof event?.error?.data === 'string' ? event.error.data : null,
+    typeof event?.error === 'string' ? event.error : null,
+    event?.message,
+    event?.data?.message,
+    typeof event?.error?.name === 'string' ? event.error.name : null,
+  ]);
+}
+
+function extractOpenCodeTextDelta(event) {
+  const direct = firstNonEmptyStr([
+    event?.text,
+    event?.delta,
+    event?.content,
+    event?.data,
+    event?.part?.text,
+    event?.part?.delta,
+    event?.output_text,
+  ]);
+  if (direct) return direct;
+
+  const message = event?.message;
+  if (message && typeof message === 'object') {
+    if (typeof message.content === 'string') return message.content;
+    if (Array.isArray(message.content)) {
+      const joined = message.content
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+          return '';
+        })
+        .join('');
+      if (joined) return joined;
+    }
+    if (typeof message.text === 'string') return message.text;
+  }
+  return null;
+}
+
+function buildWorkCwd(cwd) {
+  if (cwd && cwd !== 'undefined' && cwd !== 'null' && String(cwd).trim()) {
+    return String(cwd).trim();
+  }
+  try {
+    return getRealHomeDir() || process.cwd();
+  } catch {
+    return process.cwd();
+  }
+}
+
+function buildCliEnv() {
+  const env = { ...process.env };
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+  enrichPathWithBinDirs(env, commonCliBinDirs(home));
+  return env;
+}
+
+async function collectFromStreamingCli({
+  bin,
+  args,
+  cwd,
+  label,
+  onLine,
+  onDelta,
+  shouldTerminate,
+}) {
+  let text = '';
+  let streamError = '';
+  const result = await runCliStreaming({
+    bin,
+    args,
+    cwd,
+    env: buildCliEnv(),
+    label,
+    emitEndStream: false,
+    shouldTerminate,
+    onError: (message) => {
+      streamError = message;
+    },
+    onLine: (line) => {
+      const delta = onLine(line);
+      if (typeof delta === 'string' && delta) {
+        text += delta;
+        if (typeof onDelta === 'function') onDelta(delta);
+      }
+    },
+  });
+
+  if (result.hadError) {
+    throw new Error(streamError || result.errorMessage || `${label} CLI failed`);
+  }
+  const finalText = text.trim();
+  if (!finalText) {
+    throw new Error(`${label} CLI response is empty`);
+  }
+  return finalText;
+}
+
+async function askGrok(prompt, { model, cwd, onDelta } = {}) {
+  const preferredAuth = process.env.GROK_AUTH_METHOD || '';
+  const resolvedAuth = resolveEffectiveGrokAuth({
+    preferredAuth,
+    apiKey: process.env.XAI_API_KEY || process.env.GROK_API_KEY || '',
+    baseUrl: process.env.GROK_BASE_URL || '',
+  });
+  const env = buildGrokEnv(
+    process.env,
+    resolvedAuth.apiKey,
+    resolvedAuth.baseUrl,
+    resolvedAuth.authMethod,
+    false
+  );
+
+  // Warm path resolution for clearer errors when the binary is missing.
+  resolveGrokCliPath();
+
+  let text = '';
+  await runAcpTurn({
+    message: prompt,
+    sessionId: '',
+    cwd: buildWorkCwd(cwd),
+    model: resolveModelFlag(model) || '',
+    apiKey: resolvedAuth.apiKey,
+    baseUrl: resolvedAuth.baseUrl,
+    authMethod: resolvedAuth.authMethod,
+    // Text-only, session-less features: auto-DENY all tool requests. There is
+    // no UI to render a permission dialog, and the prompt embeds third-party
+    // controlled text (git diffs / pasted content) that must not be able to
+    // drive silent tool execution.
+    permissionMode: 'deny',
+    env,
+    onEvent: (type, payload) => {
+      if (type !== 'notification') return;
+      if (payload?.method !== 'session/update') return;
+      const update = payload?.params?.update || payload?.params;
+      if (!update || typeof update !== 'object') return;
+      const kind = update.sessionUpdate || update.type || '';
+      // Only final answer chunks — ignore thoughts / tools / noise.
+      if (kind !== 'agent_message_chunk') return;
+      const chunk = extractAcpText(update.content) || (typeof update.text === 'string' ? update.text : '');
+      if (!chunk) return;
+      text += chunk;
+      if (typeof onDelta === 'function') onDelta(chunk);
+    },
+    onStderr: (chunk) => {
+      const s = String(chunk || '').trim();
+      if (s) console.error('[CliAsk][Grok]', s.slice(0, 500));
+    },
+  });
+
+  const finalText = text.trim();
+  if (!finalText) {
+    throw new Error('Grok CLI response is empty');
+  }
+  return finalText;
+}
+
+async function askKimi(prompt, { model, cwd, onDelta } = {}) {
+  const bin = resolveKimiCliPath();
+  const args = [
+    '--output-format', 'stream-json',
+    '--prompt', safePromptArg(prompt),
+  ];
+  const modelFlag = resolveModelFlag(model);
+  if (modelFlag) args.push('--model', modelFlag);
+
+  let accumulated = '';
+  return collectFromStreamingCli({
+    bin,
+    args,
+    cwd: buildWorkCwd(cwd),
+    label: 'Kimi',
+    onDelta,
+    onLine: (line) => {
+      if (!line || !line.trim()) return '';
+      let value;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        return '';
+      }
+      if (!value || typeof value !== 'object' || value.role !== 'assistant') return '';
+      // Skip pure tool_calls frames.
+      if (Array.isArray(value.tool_calls) && value.tool_calls.length > 0 && !extractAssistantText(value)) {
+        return '';
+      }
+      const incoming = extractAssistantText(value);
+      const delta = mergeAssistantTextSnapshot(accumulated, incoming);
+      if (!delta) return '';
+      if (!accumulated) {
+        accumulated = incoming;
+      } else if (incoming.startsWith(accumulated)) {
+        accumulated = incoming;
+      } else if (!accumulated.startsWith(incoming)) {
+        accumulated = `${accumulated}${delta}`;
+      }
+      return delta;
+    },
+  });
+}
+
+async function askOpenCode(prompt, { model, cwd, onDelta } = {}) {
+  const bin = resolveOpenCodeCliPath();
+  const args = ['run', '--format', 'json'];
+  const modelFlag = resolveModelFlag(model);
+  if (modelFlag) args.push('--model', modelFlag);
+  args.push(safePromptArg(prompt));
+
+  let structuredError = '';
+  try {
+    return await collectFromStreamingCli({
+      bin,
+      args,
+      cwd: buildWorkCwd(cwd),
+      label: 'OpenCode',
+      onDelta,
+      onLine: (line) => {
+        if (!line || !line.trim()) return '';
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          return '';
+        }
+        if (!event || typeof event !== 'object') return '';
+        const type = typeof event.type === 'string' ? event.type : '';
+        const lower = type.toLowerCase();
+        if (lower === 'error' || lower.endsWith('.error')) {
+          const message = extractCliEventErrorMessage(event);
+          if (message) structuredError = message;
+          return '';
+        }
+        if (
+          lower === 'reasoning_delta'
+          || lower.includes('reasoning')
+          || lower.includes('think')
+        ) {
+          return '';
+        }
+        if (
+          lower === 'text'
+          || lower === 'content_delta'
+          || lower === 'text_delta'
+          || lower === 'output_text_delta'
+          || lower === 'assistant_message_delta'
+          || lower === 'message_delta'
+          || lower === 'assistant_message'
+          || lower === 'message'
+          || ((lower.includes('delta') || lower.includes('message') || lower.includes('text'))
+            && extractOpenCodeTextDelta(event))
+        ) {
+          return extractOpenCodeTextDelta(event) || '';
+        }
+        return '';
+      },
+    });
+  } catch (error) {
+    if (structuredError) {
+      throw new Error(structuredError);
+    }
+    throw error;
+  }
+}
+
+async function askPi(prompt, { model, cwd, onDelta } = {}) {
+  const bin = resolvePiCliPath();
+  const args = ['--print', '--mode', 'json'];
+  const modelFlag = resolveModelFlag(model);
+  if (modelFlag) args.push('--model', modelFlag);
+  args.push(safePromptArg(prompt));
+
+  return collectFromStreamingCli({
+    bin,
+    args,
+    cwd: buildWorkCwd(cwd),
+    label: 'PI',
+    onDelta,
+    onLine: (line) => {
+      if (!line || !line.trim()) return '';
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return '';
+      }
+      if (!event || typeof event !== 'object') return '';
+      if (event.type !== 'message_update') return '';
+      const update = event.assistantMessageEvent;
+      if (!update || typeof update !== 'object') return '';
+      if (update.type === 'text_delta' && typeof update.delta === 'string' && update.delta) {
+        return update.delta;
+      }
+      return '';
+    },
+  });
+}
+
+async function askOmp(prompt, { model, cwd, onDelta } = {}) {
+  const bin = resolveOmpCliPath();
+  const args = ['--print', '--mode', 'json'];
+  const modelFlag = resolveModelFlag(model);
+  if (modelFlag) args.push('--model', modelFlag);
+  args.push(safePromptArg(prompt));
+
+  return collectFromStreamingCli({
+    bin,
+    args,
+    cwd: buildWorkCwd(cwd),
+    label: 'OMP',
+    onDelta,
+    onLine: (line) => {
+      if (!line || !line.trim()) return '';
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return '';
+      }
+      if (!event || typeof event !== 'object') return '';
+      if (event.type !== 'message_update') return '';
+      const update = event.assistantMessageEvent;
+      if (!update || typeof update !== 'object') return '';
+      if (update.type === 'text_delta' && typeof update.delta === 'string' && update.delta) {
+        return update.delta;
+      }
+      return '';
+    },
+  });
+}
+
+/**
+ * One-shot ask via MiniMax Code (`minimax exec`).
+ *
+ * Security: mcode has no headless deny/no-tools policy ("ask" auto-approves
+ * when no UI is attached), so this follows the Kimi/OpenCode/PI precedent:
+ * `--permission smart` plus the caller's prompt-level "do not run tools"
+ * instruction. The CLI keeps running after the final `exec.result` line —
+ * `shouldTerminate` ends the process tree there.
+ */
+async function askMiniMax(prompt, { model, cwd, onDelta } = {}) {
+  const bin = resolveMiniMaxCliPath();
+  const args = [
+    'exec',
+    '--output-format', 'stream-json',
+    '--permission', 'smart',
+  ];
+  const modelFlag = resolveModelFlag(model);
+  if (modelFlag) args.push('--model', modelFlag);
+  const workCwd = buildWorkCwd(cwd);
+  args.push('--cwd', workCwd);
+  args.push(safePromptArg(prompt));
+
+  let sawExecResult = false;
+  let resultAnswer = '';
+  return collectFromStreamingCli({
+    bin,
+    args,
+    cwd: workCwd,
+    label: 'MiniMax',
+    onDelta,
+    onLine: (line) => {
+      if (!line || !line.trim()) return '';
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return '';
+      }
+      if (!event || typeof event !== 'object') return '';
+      if (event.type === 'delta' && typeof event.content === 'string' && event.content) {
+        return event.content;
+      }
+      if (event.type === 'exec.result') {
+        sawExecResult = true;
+        if (typeof event.answer === 'string') resultAnswer = event.answer;
+      }
+      return '';
+    },
+    shouldTerminate: (line) => line.includes('"type":"exec.result"'),
+  }).catch((error) => {
+    // Some mcode versions exit non-zero after a denied permission ask; if the
+    // run still produced a final answer, prefer it over the error.
+    if (sawExecResult && resultAnswer.trim()) {
+      return resultAnswer.trim();
+    }
+    throw error;
+  });
+}
+
+/**
+ * ZCode: session-less generation through the app-server's workspace-level
+ * text API (lighter than booting a full chat session; no tools involved).
+ */
+async function askZcode(prompt, { model, cwd } = {}) {
+  const { ZcodeAppServerClient } = await import('./zcode/zcode-appserver-client.js');
+  const {
+    resolveZcodeCliPath,
+    buildZcodeEnv,
+    resolveActiveProvider,
+  } = await import('./zcode/zcode-config.js');
+
+  const cliPath = resolveZcodeCliPath();
+  if (!cliPath) {
+    throw new Error('ZCode CLI not found. Install the ZCode desktop client, or set ZCODE_CLI_PATH.');
+  }
+  const workCwd = (cwd && String(cwd).trim()) || process.cwd();
+  const active = resolveActiveProvider();
+  if (!active) {
+    throw new Error('No active ZCode provider in ~/.zcode/v2/config.json (open the ZCode client once).');
+  }
+  const modelId = isDefaultModelToken(model) ? Object.keys(active.models || {})[0] : model;
+  if (!modelId) {
+    throw new Error('ZCode provider exposes no models.');
+  }
+
+  const client = new ZcodeAppServerClient({
+    nodePath: process.execPath,
+    cliPath,
+    cwd: workCwd,
+    env: buildZcodeEnv(),
+    onReverseRequest: async (method) => {
+      if (method === 'session/requestRuntimePreferences') {
+        return {
+          nativeSearchEnhancementsEnabled: false,
+          memoryEnabled: false,
+          askUserQuestionAutoResolutionEnabled: false,
+        };
+      }
+      const err = new Error(`unsupported reverse request: ${method}`);
+      err.code = -32601;
+      throw err;
+    },
+  });
+  client.on('stderrLine', () => {}); // drained; generation errors surface via RPC
+
+  try {
+    client.start();
+    const workspace = { workspacePath: workCwd, workspaceKey: workCwd };
+    const modelRef = { providerId: active.providerId, modelId };
+    const params = {
+      workspace,
+      modelRef,
+      prompt: String(prompt),
+      querySource: 'cc-gui-ask',
+    };
+    // The app-server only knows env-injected providers; register the client
+    // channel up front (idempotent) so generateText's modelRef resolves.
+    // provider.source is a closed enum: builtin|models-dev|custom|user|…
+    await client.request('workspace/upsertModelProvider', {
+      workspace,
+      provider: {
+        providerId: active.providerId,
+        kind: 'anthropic',
+        label: active.name || active.providerId,
+        source: active.providerId.startsWith('builtin:') ? 'builtin' : 'custom',
+        baseURL: active.baseURL,
+        ...(active.apiKey ? { apiKey: { source: 'inline', value: active.apiKey } } : {}),
+        models: Object.entries(active.models || {}).map(([id, def]) => ({
+          modelId: id,
+          label: def?.name || id,
+          contextWindow: def?.limit?.context ?? undefined,
+          maxOutputTokens: def?.limit?.output ?? undefined,
+          supportsImages: Array.isArray(def?.modalities?.input)
+            ? def.modalities.input.includes('image')
+            : undefined,
+        })),
+      },
+    });
+    const result = await client.request('workspace/generateText', params, 120_000);
+    return typeof result?.text === 'string' ? result.text.trim() : '';
+  } finally {
+    client.close();
+  }
+}
+
+/**
+ * One-shot text generation for a CLI provider.
+ *
+ * @param {object} options
+ * @param {'grok'|'kimi'|'opencode'|'pi'|'omp'|'minimax'} options.provider
+ * @param {string} options.prompt
+ * @param {string} [options.model]
+ * @param {string} [options.cwd]
+ * @param {(delta: string) => void} [options.onDelta]
+ * @returns {Promise<string>}
+ */
+export async function askCliProvider({
+  provider,
+  prompt,
+  model,
+  cwd,
+  onDelta,
+} = {}) {
+  if (!provider || !CLI_ASK_PROVIDERS.includes(provider)) {
+    throw new Error(`Unsupported CLI ask provider: ${provider || '(none)'}`);
+  }
+  if (!prompt || !String(prompt).trim()) {
+    return '';
+  }
+
+  const resolvedModel = model || DEFAULT_MODELS[provider] || '';
+  const opts = { model: resolvedModel, cwd, onDelta };
+
+  switch (provider) {
+    case 'grok':
+      return askGrok(prompt, opts);
+    case 'kimi':
+      return askKimi(prompt, opts);
+    case 'opencode':
+      return askOpenCode(prompt, opts);
+    case 'pi':
+      return askPi(prompt, opts);
+    case 'omp':
+      return askOmp(prompt, opts);
+    case 'minimax':
+      return askMiniMax(prompt, opts);
+    case 'zcode':
+      return askZcode(prompt, opts);
+    default:
+      throw new Error(`Unsupported CLI ask provider: ${provider}`);
+  }
+}
+
+export function isCliAskProvider(provider) {
+  return typeof provider === 'string' && CLI_ASK_PROVIDERS.includes(provider);
+}
