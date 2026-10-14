@@ -1,0 +1,76 @@
+name: Tests
+
+# CI test coverage for every component of the plugin:
+#   - ai-bridge unit tests (node:test)
+#   - webview unit tests (vitest + tsc typecheck)
+#   - Java unit tests (Linux)
+#   - WSL integration tests (Windows + WSL)
+# All jobs run in parallel and are intentionally independent of build.yml, so a
+# test failure can never block the Build Plugin job.
+on:
+  workflow_dispatch:
+
+jobs:
+  # ai-bridge tests use Node's built-in test runner (node:test). They are
+  # invoked from the repository root because api-config.test.js resolves modules
+  # via path.resolve('ai-bridge/...') relative to the working directory.
+  java-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          java: 21
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest-21-arm64
+    name: Java unit tests (Linux) [${{ matrix.expander_leg }}]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+      # build.gradle pins the Java toolchain to 17. The x64 hosted images ship a
+      # JDK 17, but windows-11-arm does not, and no toolchain download repository
+      # is configured. Install JDK 17 explicitly so setup-gradle can register it
+      # (JAVA_HOME_17_*) for toolchain detection on every runner. The Microsoft
+      # build is used because it provides a Windows aarch64 JDK 17.
+    - name: Setup JDK 17 (Gradle toolchain)
+      uses: actions/setup-java@v5
+      with:
+        java-version: '17'
+        distribution: 'microsoft'
+
+      # Installed last so the matrix JDK remains the default JAVA_HOME that runs Gradle.
+    - name: Setup JDK ${{ matrix.java }}
+      uses: actions/setup-java@v5
+      with:
+        java-version: '${{ matrix.java }}'
+        distribution: 'temurin'
+
+    - name: Setup Node.js 22
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22.12.0'
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v5
+
+    - name: Install webview dependencies
+      working-directory: webview
+      run: npm ci
+
+    - name: Install ai-bridge dependencies
+      working-directory: ai-bridge
+      run: npm ci
+
+    - name: Run tests
+      run: ./gradlew test
+
+  # Runs the Windows+WSL integration tests that the Linux job cannot exercise.
+  # Vampire/setup-wsl installs a real WSL distro so isWslPath /
+  # resolveWslHomeUncPath / resolveHomeForFileOps behave as on a developer's
+  # Windows+WSL machine. The tests still Assume WSL availability, so they
+  # self-skip if the distro fails to come up rather than producing false
+  # failures.
+    timeout-minutes: 150
